@@ -8,24 +8,8 @@ pub enum PaintressError {
     #[error("display not found: {0}")]
     DisplayNotFound(String),
 
-    #[error("grid {layout} needs {needed} displays, but only {available} found")]
-    NotEnoughDisplays {
-        layout: String,
-        needed: usize,
-        available: usize,
-    },
-
-    #[error("invalid layout format '{0}' — expected COLSxROWS (e.g. 2x1)")]
-    InvalidLayout(String),
-
     #[error("invalid rotation '{0}' — expected none, cw90, ccw90, or flip180")]
     InvalidRotation(String),
-
-    #[error("invalid position '{0}' — options: left, right, top, bottom, topleft, topright, bottomleft, bottomright")]
-    InvalidPosition(String),
-
-    #[error("invalid placement spec '{0}' — expected DISPLAY@COL,ROW[:ROTATION]")]
-    InvalidPlacementSpec(String),
 
     #[error("image error: {0}")]
     Image(#[from] image::ImageError),

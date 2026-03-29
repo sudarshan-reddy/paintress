@@ -1,13 +1,13 @@
 [[display]]
 serial = "f8c0a8"
 name = "f8c0a8"
-col = 0
+col = 1
 row = 0
-mounted = "portrait-right"
+mounted = "portrait-left"
 
 [[display]]
 serial = "f8fab4"
 name = "f8fab4"
-col = 1
+col = 0
 row = 0
-mounted = "portrait-left"
+mounted = "portrait-right"

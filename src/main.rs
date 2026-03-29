@@ -1,17 +1,18 @@
+mod backend;
 mod config;
 mod discovery;
 mod error;
 mod image;
 mod layout;
-mod ota;
 mod palette;
-mod transport;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
+use crate::backend::esp32::Esp32Backend;
+use crate::backend::{DisplayBackend, Updatable};
 use crate::config::{Config, Mounting};
 use crate::discovery::DisplayInfo;
 use crate::error::{PaintressError, Result};
@@ -69,10 +70,6 @@ enum Command {
     },
 }
 
-fn discover_displays(timeout: f64) -> Result<Vec<DisplayInfo>> {
-    discovery::discover(Duration::from_secs_f64(timeout))
-}
-
 /// Load or auto-create the config, merging any newly discovered displays.
 fn load_or_create_config(displays: &[DisplayInfo]) -> Result<Config> {
     let config = match Config::load()? {
@@ -90,8 +87,8 @@ fn load_or_create_config(displays: &[DisplayInfo]) -> Result<Config> {
     Ok(config)
 }
 
-async fn cmd_discover(timeout: f64) -> Result<()> {
-    let displays = discover_displays(timeout)?;
+async fn cmd_discover(backend: &impl DisplayBackend, timeout: f64) -> Result<()> {
+    let displays = backend.discover(std::time::Duration::from_secs_f64(timeout)).await?;
     if displays.is_empty() {
         eprintln!("No displays found.");
         return Ok(());
@@ -101,7 +98,6 @@ async fn cmd_discover(timeout: f64) -> Result<()> {
 
     eprintln!("\nFound {} display(s):\n", displays.len());
     for d in &displays {
-        // Find the config entry for this display
         let cfg = config.display.iter().find(|c| c.serial == d.id);
         let name = cfg.map(|c| c.name.as_str()).unwrap_or(&d.id);
         let mounted = cfg.map(|c| c.mounted).unwrap_or_default();
@@ -121,8 +117,8 @@ async fn cmd_discover(timeout: f64) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(timeout: f64) -> Result<()> {
-    let displays = discover_displays(timeout)?;
+async fn cmd_status<B: DisplayBackend>(backend: &Arc<B>, timeout: f64) -> Result<()> {
+    let displays = backend.discover(std::time::Duration::from_secs_f64(timeout)).await?;
     if displays.is_empty() {
         eprintln!("No displays found.");
         return Ok(());
@@ -131,8 +127,9 @@ async fn cmd_status(timeout: f64) -> Result<()> {
 
     let mut handles = Vec::new();
     for d in displays {
+        let backend = Arc::clone(backend);
         handles.push(tokio::spawn(async move {
-            match transport::fetch_info(&d).await {
+            match backend.fetch_info(&d).await {
                 Ok(info) => {
                     let id = info
                         .get("id")
@@ -167,8 +164,7 @@ async fn cmd_status(timeout: f64) -> Result<()> {
     Ok(())
 }
 
-/// Build a layout from the config file. Each display becomes a freeform placement
-/// with position and rotation derived from its config entry.
+/// Build a layout from the config file.
 fn build_layout_from_config(
     config: &Config,
     discovered: &[DisplayInfo],
@@ -188,13 +184,14 @@ fn build_layout_from_config(
     Ok((Box::new(layout), display_info))
 }
 
-async fn cmd_send(
+async fn cmd_send<B: DisplayBackend>(
+    backend: &Arc<B>,
     image_path: &PathBuf,
     preview_only: bool,
     timeout: f64,
     saturation: f32,
 ) -> Result<()> {
-    let displays = discover_displays(timeout)?;
+    let displays = backend.discover(std::time::Duration::from_secs_f64(timeout)).await?;
     if displays.is_empty() {
         return Err(PaintressError::NoDisplaysFound);
     }
@@ -233,19 +230,16 @@ async fn cmd_send(
         return Ok(());
     }
 
-    send_layout(&indexed, layout.placements()).await
+    send_tiles(backend, &indexed, layout.placements()).await
 }
 
 fn cmd_preview(image_path: &PathBuf, saturation: f32) -> Result<()> {
-    // Use config if it exists, otherwise default to single display
     let config = Config::load()?;
 
     let (canvas_w, canvas_h, placements) = if let Some(ref config) = config {
-        // Compute canvas from config without needing network
         let mut builder = FreeformBuilder::new();
         for dc in &config.display {
             let (_cw, _ch) = dc.mounted.canvas_dims(DISPLAY_WIDTH, DISPLAY_HEIGHT);
-            // Create a dummy DisplayInfo for preview
             let dummy = DisplayInfo {
                 id: dc.serial.clone(),
                 ip: String::new(),
@@ -282,7 +276,6 @@ fn cmd_preview(image_path: &PathBuf, saturation: f32) -> Result<()> {
 fn save_preview(indexed: &IndexedImage, placements: &[Placement], _config: &Config) -> Result<()> {
     let mut preview = indexed.to_rgb();
 
-    // Draw grid lines and labels
     let magenta = ::image::Rgb([255u8, 0, 255]);
     for p in placements {
         let x0 = p.x;
@@ -290,7 +283,6 @@ fn save_preview(indexed: &IndexedImage, placements: &[Placement], _config: &Conf
         let x1 = p.x + p.canvas_w;
         let y1 = p.y + p.canvas_h;
 
-        // Draw border
         for x in x0..x1 {
             if y0 > 0 {
                 preview.put_pixel(x, y0, magenta);
@@ -314,7 +306,11 @@ fn save_preview(indexed: &IndexedImage, placements: &[Placement], _config: &Conf
     Ok(())
 }
 
-async fn send_layout(indexed: &IndexedImage, placements: &[Placement]) -> Result<()> {
+async fn send_tiles<B: DisplayBackend>(
+    backend: &Arc<B>,
+    indexed: &IndexedImage,
+    placements: &[Placement],
+) -> Result<()> {
     eprintln!("Sending tiles...");
 
     let mut handles = Vec::new();
@@ -322,8 +318,9 @@ async fn send_layout(indexed: &IndexedImage, placements: &[Placement]) -> Result
         let tile = indexed.crop(p.x, p.y, p.canvas_w, p.canvas_h);
         let raw = tile.pack_rotated(p.rotation);
         let display = p.display.clone();
+        let backend = Arc::clone(backend);
         handles.push(tokio::spawn(async move {
-            transport::send_raw(&display, raw).await
+            backend.send_raw(&display, raw).await
         }));
     }
 
@@ -337,7 +334,12 @@ async fn send_layout(indexed: &IndexedImage, placements: &[Placement]) -> Result
     Ok(())
 }
 
-async fn cmd_ota(firmware: &PathBuf, to: &str, timeout: f64) -> Result<()> {
+async fn cmd_ota<B: Updatable>(
+    backend: &Arc<B>,
+    firmware: &PathBuf,
+    to: &str,
+    timeout: f64,
+) -> Result<()> {
     if !firmware.exists() {
         return Err(PaintressError::Generic(format!(
             "firmware file not found: {}",
@@ -345,8 +347,8 @@ async fn cmd_ota(firmware: &PathBuf, to: &str, timeout: f64) -> Result<()> {
         )));
     }
 
-    let displays = discover_displays(timeout)?;
-    let targets = discovery::resolve_target(&displays, to)?;
+    let displays = backend.discover(std::time::Duration::from_secs_f64(timeout)).await?;
+    let targets = backend.resolve_target(&displays, to)?;
 
     eprintln!(
         "OTA update: {} -> {} display(s)\n",
@@ -356,7 +358,7 @@ async fn cmd_ota(firmware: &PathBuf, to: &str, timeout: f64) -> Result<()> {
 
     for t in targets {
         eprintln!("  Updating {} ({})...", t.id, t.hostname);
-        let result = ota::ota_update(t, firmware)?;
+        let result = backend.update_firmware(t, firmware).await?;
         println!("    {result}");
     }
     Ok(())
@@ -365,19 +367,20 @@ async fn cmd_ota(firmware: &PathBuf, to: &str, timeout: f64) -> Result<()> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let backend = Arc::new(Esp32Backend::new());
 
     let result = match cli.command {
-        Command::Discover => cmd_discover(cli.timeout).await,
-        Command::Status => cmd_status(cli.timeout).await,
+        Command::Discover => cmd_discover(&*backend, cli.timeout).await,
+        Command::Status => cmd_status(&backend, cli.timeout).await,
         Command::Send {
             ref image,
             preview,
-        } => cmd_send(image, preview, cli.timeout, cli.saturation).await,
+        } => cmd_send(&backend, image, preview, cli.timeout, cli.saturation).await,
         Command::Preview { ref image } => cmd_preview(image, cli.saturation),
         Command::Ota {
             ref firmware,
             ref to,
-        } => cmd_ota(firmware, to, cli.timeout).await,
+        } => cmd_ota(&backend, firmware, to, cli.timeout).await,
     };
 
     if let Err(e) = result {

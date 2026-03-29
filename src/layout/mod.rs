@@ -1,5 +1,4 @@
 pub mod freeform;
-pub mod grid;
 
 use crate::discovery::DisplayInfo;
 use crate::image::Rotation;
