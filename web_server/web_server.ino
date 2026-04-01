@@ -139,6 +139,22 @@ WiFiServer tcpServer(80);
 const size_t EXPECTED_SIZE = (WIDTH * HEIGHT) / 2;  // 192000
 uint8_t* imageBuffer = nullptr;
 volatile bool isUpdating = false;
+unsigned long lastWifiCheck = 0;
+TaskHandle_t refreshTaskHandle = nullptr;
+
+// FreeRTOS task: runs display refresh on core 0 so the main loop stays responsive
+void refreshTask(void* param) {
+  Serial.printf("[%lu] Refresh task: starting on core %d\n", millis(), xPortGetCoreID());
+  unsigned long t = millis();
+  epdInit();
+  epdSendImage(imageBuffer, EXPECTED_SIZE);
+  epdRefresh();
+  epdSleep();
+  Serial.printf("[%lu] Refresh task: done in %lu ms\n", millis(), millis() - t);
+  isUpdating = false;
+  refreshTaskHandle = nullptr;
+  vTaskDelete(NULL);
+}
 
 void setupWiFi() {
   WiFi.begin(ssid, password);
@@ -221,10 +237,21 @@ void sendJsonResponse(WiFiClient& client, const String& json) {
 }
 
 void handleClient(WiFiClient& client) {
+  unsigned long connTime = millis();
+  String clientIP = client.remoteIP().toString();
+  Serial.printf("[%lu] Client %s connected (free heap: %u)\n", connTime, clientIP.c_str(), ESP.getFreeHeap());
+
   // Read first line to determine request type
   String firstLine = client.readStringUntil('\n');
   firstLine.trim();
   String path = getPath(firstLine);
+  Serial.printf("[%lu] Request: %s (path: %s)\n", millis(), firstLine.c_str(), path.c_str());
+
+  if (firstLine.length() == 0) {
+    Serial.printf("[%lu] WARNING: empty first line (client timeout or no data sent)\n", millis());
+    client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nEmpty request\r\n");
+    return;
+  }
 
   if (firstLine.startsWith("GET")) {
     skipHeaders(client);
@@ -240,6 +267,7 @@ void handleClient(WiFiClient& client) {
                     ",\"uptime\":" + String(millis() / 1000) +
                     ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       sendJsonResponse(client, json);
+      Serial.printf("[%lu] Sent /info response\n", millis());
       return;
     }
 
@@ -261,21 +289,25 @@ void handleClient(WiFiClient& client) {
 
   if (!firstLine.startsWith("POST")) {
     skipHeaders(client);
+    Serial.printf("[%lu] Rejected: method not allowed\n", millis());
     client.print("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
     return;
   }
 
   if (isUpdating) {
     skipHeaders(client);
+    Serial.printf("[%lu] Rejected: display is busy refreshing\n", millis());
     client.print("HTTP/1.1 503 Busy\r\nConnection: close\r\n\r\nDisplay is refreshing\r\n");
     return;
   }
 
   // Skip HTTP headers to get to the body
   if (!skipHeaders(client)) {
+    Serial.printf("[%lu] ERROR: timed out reading HTTP headers\n", millis());
     client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nTimeout reading headers\r\n");
     return;
   }
+  Serial.printf("[%lu] Headers parsed OK\n", millis());
 
   // Allocate buffer if needed
   if (!imageBuffer) {
@@ -283,6 +315,7 @@ void handleClient(WiFiClient& client) {
     if (!imageBuffer) imageBuffer = (uint8_t*)malloc(EXPECTED_SIZE);
   }
   if (!imageBuffer) {
+    Serial.printf("[%lu] ERROR: failed to allocate %u bytes\n", millis(), EXPECTED_SIZE);
     client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nOut of memory\r\n");
     return;
   }
@@ -294,38 +327,34 @@ void handleClient(WiFiClient& client) {
     if (client.available()) {
       size_t chunk = client.read(imageBuffer + received, EXPECTED_SIZE - received);
       received += chunk;
-      if (received % 10000 < chunk) {
-        Serial.printf("  received %u / %u bytes\n", received, EXPECTED_SIZE);
+      if (received % 48000 < chunk) {
+        Serial.printf("[%lu]   body: %u / %u bytes (%u%%)\n", millis(), received, EXPECTED_SIZE, received * 100 / EXPECTED_SIZE);
       }
     } else {
       delay(1);
     }
   }
 
-  Serial.printf("Received %u bytes total\n", received);
+  unsigned long recvMs = millis() - start;
+  Serial.printf("[%lu] Received %u / %u bytes in %lu ms\n", millis(), received, EXPECTED_SIZE, recvMs);
 
   if (received != EXPECTED_SIZE) {
+    Serial.printf("[%lu] ERROR: bad body size (got %u, need %u)\n", millis(), received, EXPECTED_SIZE);
     String msg = "Bad size: got " + String(received) + ", need " + String(EXPECTED_SIZE) + "\r\n";
     client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
     client.print(msg);
     return;
   }
 
-  // Send response before starting the slow display update
+  // Send response IMMEDIATELY, then kick off refresh in background
   client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK — refreshing display\r\n");
   client.flush();
   client.stop();
+  Serial.printf("[%lu] Response sent, connection closed (total request: %lu ms)\n", millis(), millis() - connTime);
 
-  // Update display
+  // Start display refresh in a background FreeRTOS task so loop() stays responsive
   isUpdating = true;
-  Serial.println("Refreshing display...");
-  unsigned long t = millis();
-  epdInit();
-  epdSendImage(imageBuffer, EXPECTED_SIZE);
-  epdRefresh();
-  epdSleep();
-  Serial.printf("Done in %lu ms\n", millis() - t);
-  isUpdating = false;
+  xTaskCreatePinnedToCore(refreshTask, "epd_refresh", 4096, NULL, 1, &refreshTaskHandle, 0);
 }
 
 void setup() {
@@ -361,12 +390,31 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
 
+  // Reconnect WiFi if dropped
+  if (millis() - lastWifiCheck > 10000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("[%lu] WiFi disconnected! Reconnecting...\n", millis());
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      unsigned long wifiStart = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+        delay(250);
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[%lu] WiFi reconnected: %s\n", millis(), WiFi.localIP().toString().c_str());
+      } else {
+        Serial.printf("[%lu] WiFi reconnect failed\n", millis());
+      }
+    }
+  }
+
   WiFiClient client = tcpServer.available();
   if (client) {
-    Serial.println("Client connected");
+    Serial.printf("[%lu] --- New connection ---\n", millis());
     handleClient(client);
     client.stop();
-    Serial.println("Client disconnected");
+    Serial.printf("[%lu] --- Connection closed ---\n", millis());
   }
   delay(2);
 }

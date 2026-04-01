@@ -327,7 +327,7 @@ async fn send_tiles<B: DisplayBackend>(
     for h in handles {
         match h.await {
             Ok(Ok(msg)) => println!("  {msg}"),
-            Ok(Err(e)) => println!("  error: {e}"),
+            Ok(Err(e)) => println!("  error: {e:?}"),
             Err(e) => println!("  task error: {e}"),
         }
     }
