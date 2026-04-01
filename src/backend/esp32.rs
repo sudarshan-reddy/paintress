@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -152,7 +153,17 @@ fn discover_mdns(timeout: Duration) -> Result<Vec<DisplayInfo>> {
 
     let _ = mdns.shutdown();
 
-    let mut result: Vec<DisplayInfo> = displays.into_values().collect();
+    // Verify each display is actually reachable (mDNS cache can be stale)
+    let mut result: Vec<DisplayInfo> = Vec::new();
+    for d in displays.into_values() {
+        if let Ok(addr) = format!("{}:{}", d.ip, d.port).parse::<SocketAddr>() {
+            if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+                result.push(d);
+            } else {
+                eprintln!("  {} ({}) — not reachable, skipping", d.id, d.ip);
+            }
+        }
+    }
     result.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
 }
