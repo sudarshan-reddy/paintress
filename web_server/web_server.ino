@@ -28,6 +28,28 @@ const char* password = "WIFI-PASSWORD";
 #define WIDTH  800
 #define HEIGHT 480
 
+// -------- BATTERY --------
+// XIAO ESP32-S3: enable voltage divider on GPIO14, read ADC on GPIO1 (A0)
+#define BATT_READ_ENABLE 14
+#define BATT_ADC_PIN      1
+
+float readBatteryVoltage() {
+  digitalWrite(BATT_READ_ENABLE, HIGH);
+  delay(10);  // let ADC settle
+  uint32_t raw = analogReadMilliVolts(BATT_ADC_PIN);
+  digitalWrite(BATT_READ_ENABLE, LOW);
+  // Voltage divider halves the battery voltage
+  return (raw * 2.0f) / 1000.0f;
+}
+
+int batteryPercent(float voltage) {
+  // LiPo: 4.2V = 100%, 3.0V = 0%
+  int pct = (int)((voltage - 3.0f) / (4.2f - 3.0f) * 100.0f);
+  if (pct > 100) pct = 100;
+  if (pct < 0) pct = 0;
+  return pct;
+}
+
 // Unique hostname derived from chip MAC
 String chipId;
 String hostname;
@@ -259,12 +281,16 @@ void handleClient(WiFiClient& client) {
     // /info — JSON endpoint for orchestrator
     if (path == "/info") {
       String status = isUpdating ? "busy" : "ready";
+      float battV = readBatteryVoltage();
+      int battPct = batteryPercent(battV);
       String json = "{\"id\":\"" + chipId + "\""
                     ",\"hostname\":\"" + hostname + "\""
                     ",\"width\":" + String(WIDTH) +
                     ",\"height\":" + String(HEIGHT) +
                     ",\"status\":\"" + status + "\""
                     ",\"uptime\":" + String(millis() / 1000) +
+                    ",\"battery\":{\"voltage\":" + String(battV, 2) +
+                    ",\"percent\":" + String(battPct) + "}" +
                     ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       sendJsonResponse(client, json);
       Serial.printf("[%lu] Sent /info response\n", millis());
@@ -374,6 +400,10 @@ void setup() {
   pinMode(EPD_RST, OUTPUT);
   pinMode(EPD_BUSY, INPUT);
   digitalWrite(EPD_CS, HIGH);
+
+  pinMode(BATT_READ_ENABLE, OUTPUT);
+  digitalWrite(BATT_READ_ENABLE, LOW);
+  analogReadResolution(12);
 
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
