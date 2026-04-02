@@ -8,6 +8,7 @@
 #include <Update.h>
 #include "esp_wifi.h"
 #include "esp_sleep.h"
+#include "esp_pm.h"
 
 // -------- CONFIG --------
 // TODO: I mean, obviously env variable opportunity
@@ -255,8 +256,6 @@ WiFiServer tcpServer(80);
 const size_t EXPECTED_SIZE = (WIDTH * HEIGHT) / 2;  // 192000
 uint8_t* imageBuffer = nullptr;
 volatile bool isUpdating = false;
-volatile bool sleepRequested = false;
-volatile uint32_t sleepDurationSeconds = 0;
 unsigned long lastWifiCheck = 0;
 TaskHandle_t refreshTaskHandle = nullptr;
 
@@ -408,8 +407,7 @@ void handleClient(WiFiClient& client) {
       "POST 192000 bytes of 4bpp raw data to /display\r\n"
       "GET /info — JSON status\r\n"
       "GET /logs — device logs\r\n"
-      "GET /logs?clear=1 — device logs (clear after read)\r\n"
-      "POST /sleep?seconds=N — light-sleep for N seconds (1-86400)\r\n";
+      "GET /logs?clear=1 — device logs (clear after read)\r\n";
     client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
     client.print(body.length());
     client.print("\r\nConnection: close\r\n\r\n");
@@ -428,31 +426,6 @@ void handleClient(WiFiClient& client) {
     skipHeaders(client);
     deviceLog("rejected: display is busy refreshing");
     client.print("HTTP/1.1 503 Busy\r\nConnection: close\r\n\r\nDisplay is refreshing\r\n");
-    return;
-  }
-
-  // -------- POST /sleep?seconds=N — enter light-sleep --------
-  if (path.startsWith("/sleep")) {
-    skipHeaders(client);
-    // Parse seconds from query string
-    uint32_t seconds = 0;
-    int idx = path.indexOf("seconds=");
-    if (idx >= 0) {
-      seconds = path.substring(idx + 8).toInt();
-    }
-    if (seconds == 0 || seconds > 86400) {
-      deviceLog("rejected: invalid sleep seconds=%u", seconds);
-      client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad seconds (1-86400)\r\n");
-      return;
-    }
-    sleepDurationSeconds = seconds;
-    sleepRequested = true;
-    String body = "sleeping for " + String(seconds) + "s";
-    deviceLog("sleep requested: %us", seconds);
-    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
-    client.print(body.length());
-    client.print("\r\nConnection: close\r\n\r\n");
-    client.print(body);
     return;
   }
 
@@ -610,7 +583,18 @@ void setup() {
   delay(100);
 
   setupWiFi();
-  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+
+  // Enable automatic light-sleep: CPU sleeps when idle, WiFi MAC wakes it on incoming packets
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  esp_sleep_enable_wifi_wakeup();
+  esp_pm_config_t pm_config = {
+    .max_freq_mhz = 240,
+    .min_freq_mhz = 80,
+    .light_sleep_enable = true
+  };
+  esp_pm_configure(&pm_config);
+  deviceLog("auto light-sleep enabled (WiFi wakeup)");
+
   setupMDNS();
   tcpServer.begin();
 
@@ -641,32 +625,6 @@ void loop() {
   if (client) {
     handleClient(client);
     client.stop();
-  }
-
-  // Execute light-sleep if requested (after client is fully closed)
-  if (sleepRequested) {
-    sleepRequested = false;
-    uint32_t seconds = sleepDurationSeconds;
-    deviceLog("entering light-sleep for %us...", seconds);
-
-    // Tear down networking
-    tcpServer.stop();
-    MDNS.end();
-    WiFi.disconnect(true);
-    delay(100);
-
-    // Configure timer wakeup and sleep
-    uint64_t duration_us = (uint64_t)seconds * 1000000ULL;
-    esp_sleep_enable_timer_wakeup(duration_us);
-    esp_light_sleep_start();
-
-    // Woke up — restore networking
-    deviceLog("woke from light-sleep");
-    setupWiFi();
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-    setupMDNS();
-    tcpServer.begin();
-    deviceLog("ready after wake: http://%s.local/info", hostname.c_str());
   }
 
   delay(2);

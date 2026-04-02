@@ -57,11 +57,4 @@ pub trait DisplayBackend: Send + Sync + 'static {
         display: &DisplayInfo,
         firmware: &PathBuf,
     ) -> impl std::future::Future<Output = Result<String>> + Send;
-
-    /// Tell a display to enter light-sleep for the given number of seconds.
-    fn send_sleep(
-        &self,
-        display: &DisplayInfo,
-        seconds: u32,
-    ) -> impl std::future::Future<Output = Result<String>> + Send;
 }

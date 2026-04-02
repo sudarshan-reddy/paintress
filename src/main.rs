@@ -51,10 +51,6 @@ enum Command {
         /// Save preview instead of sending
         #[arg(long)]
         preview: bool,
-
-        /// After sending, put displays to sleep for N seconds
-        #[arg(long)]
-        sleep: Option<u32>,
     },
 
     /// Preview an image without sending (no network needed)
@@ -199,16 +195,10 @@ async fn cmd_send<B: DisplayBackend>(
     backend: &Arc<B>,
     image_path: &PathBuf,
     preview_only: bool,
-    sleep_seconds: Option<u32>,
     timeout: f64,
     saturation: f32,
 ) -> Result<()> {
-    let config = Config::load()?;
-    let expected_count = config.as_ref().map(|c| c.display.len()).unwrap_or(0);
-
-    // Discovery with retry: if we find fewer displays than config expects,
-    // retry at 10s intervals (displays may still be waking from sleep).
-    let displays = discover_with_retry(backend, timeout, expected_count).await?;
+    let displays = backend.discover(std::time::Duration::from_secs_f64(timeout)).await?;
     if displays.is_empty() {
         return Err(PaintressError::NoDisplaysFound);
     }
@@ -247,16 +237,7 @@ async fn cmd_send<B: DisplayBackend>(
         return Ok(());
     }
 
-    send_tiles(backend, &indexed, layout.placements()).await?;
-
-    // After sending, optionally put displays to sleep
-    if let Some(seconds) = sleep_seconds {
-        let all_displays: Vec<DisplayInfo> = layout.placements().iter().map(|p| p.display.clone()).collect();
-        wait_for_ready(backend, &all_displays).await;
-        sleep_displays(backend, &all_displays, seconds).await;
-    }
-
-    Ok(())
+    send_tiles(backend, &indexed, layout.placements()).await
 }
 
 fn cmd_preview(image_path: &PathBuf, saturation: f32) -> Result<()> {
@@ -360,105 +341,6 @@ async fn send_tiles<B: DisplayBackend>(
     Ok(())
 }
 
-/// Discovery with retry: waits for sleeping displays to come back online.
-/// Retries at 10s intervals for up to 5 attempts if fewer displays found than expected.
-async fn discover_with_retry<B: DisplayBackend>(
-    backend: &Arc<B>,
-    timeout: f64,
-    expected_count: usize,
-) -> Result<Vec<DisplayInfo>> {
-    let discovery_timeout = std::time::Duration::from_secs_f64(timeout);
-    let max_retries = if expected_count > 0 { 5 } else { 0 };
-
-    for attempt in 0..=max_retries {
-        let displays = backend.discover(discovery_timeout).await?;
-
-        if expected_count == 0 || displays.len() >= expected_count {
-            return Ok(displays);
-        }
-
-        if attempt < max_retries {
-            eprintln!(
-                "Found {}/{} displays, retrying in 10s (displays may be waking from sleep)...",
-                displays.len(),
-                expected_count
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        } else {
-            // Last attempt — return whatever we found
-            eprintln!(
-                "Found {}/{} displays after {} retries, proceeding",
-                displays.len(),
-                expected_count,
-                max_retries
-            );
-            return Ok(displays);
-        }
-    }
-
-    unreachable!()
-}
-
-/// Poll displays until all report status "ready" (refresh complete).
-/// Times out after 90s per display.
-async fn wait_for_ready<B: DisplayBackend>(backend: &Arc<B>, displays: &[DisplayInfo]) {
-    eprintln!("Waiting for displays to finish refreshing...");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
-
-    let mut pending: Vec<&DisplayInfo> = displays.iter().collect();
-    while !pending.is_empty() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let mut still_pending = Vec::new();
-        for d in &pending {
-            match backend.fetch_info(d).await {
-                Ok(info) => {
-                    let status = info
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    if status != "ready" {
-                        still_pending.push(*d);
-                    }
-                }
-                Err(_) => {
-                    still_pending.push(*d);
-                }
-            }
-        }
-        pending = still_pending;
-    }
-    if !pending.is_empty() {
-        eprintln!(
-            "Warning: {} display(s) still not ready after 90s, sending sleep anyway",
-            pending.len()
-        );
-    }
-}
-
-/// Send sleep command to all displays concurrently.
-async fn sleep_displays<B: DisplayBackend>(
-    backend: &Arc<B>,
-    displays: &[DisplayInfo],
-    seconds: u32,
-) {
-    eprintln!("Sending sleep command ({}s) to {} display(s)...", seconds, displays.len());
-    let mut handles = Vec::new();
-    for d in displays {
-        let display = d.clone();
-        let backend = Arc::clone(backend);
-        handles.push(tokio::spawn(async move {
-            backend.send_sleep(&display, seconds).await
-        }));
-    }
-    for h in handles {
-        match h.await {
-            Ok(Ok(msg)) => eprintln!("  {msg}"),
-            Ok(Err(e)) => eprintln!("  sleep error: {e}"),
-            Err(e) => eprintln!("  task error: {e}"),
-        }
-    }
-}
-
 async fn cmd_logs<B: DisplayBackend>(
     backend: &Arc<B>,
     follow: bool,
@@ -553,8 +435,7 @@ async fn main() {
         Command::Send {
             ref image,
             preview,
-            sleep,
-        } => cmd_send(&backend, image, preview, sleep, cli.timeout, cli.saturation).await,
+        } => cmd_send(&backend, image, preview, cli.timeout, cli.saturation).await,
         Command::Preview { ref image } => cmd_preview(image, cli.saturation),
         Command::Logs { follow } => cmd_logs(&backend, follow, cli.timeout).await,
         Command::Ota {

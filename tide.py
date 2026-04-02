@@ -131,16 +131,13 @@ def pick_image(folder):
     return os.path.join(folder, random.choice(images))
 
 
-def send_image(state, sleep_seconds=None):
+def send_image(state):
     """Pick and send an image for the given tide state."""
     folder = HIGH_DIR if state == "high" else LOW_DIR
     image = pick_image(folder)
     log(f"sending {state} tide image: {os.path.basename(image)}")
     try:
-        cmd = [PAINTRESS, "send", image]
-        if sleep_seconds is not None:
-            cmd.extend(["--sleep", str(sleep_seconds)])
-        subprocess.run(cmd, check=True)
+        subprocess.run([PAINTRESS, "send", image], check=True)
         log("send complete")
     except subprocess.CalledProcessError as e:
         log(f"send failed (exit {e.returncode}), will retry next cycle")
@@ -157,13 +154,7 @@ def main():
             time.sleep(300)
             continue
 
-        # Calculate sleep duration for displays (wake 2 min early for WiFi reconnect)
-        now = datetime.now(timezone.utc)
-        wait_seconds = max(0, (next_change - now).total_seconds())
-        display_sleep = int(wait_seconds - 120)
-        sleep_arg = display_sleep if display_sleep > 60 else None
-
-        send_image(state, sleep_seconds=sleep_arg)
+        send_image(state)
 
         # Sleep until the next tidal change
         now = datetime.now(timezone.utc)
