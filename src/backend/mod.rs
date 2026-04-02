@@ -44,13 +44,14 @@ pub trait DisplayBackend: Send + Sync + 'static {
         display: &DisplayInfo,
         data: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<String>> + Send;
-}
 
-/// Optional capability: firmware updates over the air.
-///
-/// Kept as a separate trait because not every backend supports OTA
-/// (e.g. a simulator never will).
-pub trait Updatable: DisplayBackend {
+    /// Fetch device logs from a single display (clears the buffer after read).
+    fn fetch_logs(
+        &self,
+        display: &DisplayInfo,
+    ) -> impl std::future::Future<Output = Result<String>> + Send;
+
+    /// Send a firmware binary to a single display for OTA update.
     fn update_firmware(
         &self,
         display: &DisplayInfo,

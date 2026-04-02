@@ -12,7 +12,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 use crate::backend::esp32::Esp32Backend;
-use crate::backend::{DisplayBackend, Updatable};
+use crate::backend::DisplayBackend;
 use crate::config::{Config, Mounting};
 use crate::discovery::DisplayInfo;
 use crate::error::{PaintressError, Result};
@@ -59,12 +59,19 @@ enum Command {
         image: PathBuf,
     },
 
-    /// OTA firmware update
+    /// Fetch device logs from all displays
+    Logs {
+        /// Poll continuously every 2 seconds
+        #[arg(long)]
+        follow: bool,
+    },
+
+    /// OTA firmware update via HTTP
     Ota {
         /// Firmware binary file (.bin)
         firmware: PathBuf,
 
-        /// Display ID or 'all'
+        /// Display ID, hostname, or 'all'
         #[arg(long, default_value = "all")]
         to: String,
     },
@@ -334,7 +341,56 @@ async fn send_tiles<B: DisplayBackend>(
     Ok(())
 }
 
-async fn cmd_ota<B: Updatable>(
+async fn cmd_logs<B: DisplayBackend>(
+    backend: &Arc<B>,
+    follow: bool,
+    timeout: f64,
+) -> Result<()> {
+    loop {
+        let displays = backend
+            .discover(std::time::Duration::from_secs_f64(timeout))
+            .await?;
+        if displays.is_empty() {
+            eprintln!("No displays found.");
+            if !follow {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
+        let mut handles = Vec::new();
+        for d in displays {
+            let backend = Arc::clone(backend);
+            handles.push(tokio::spawn(async move {
+                let id = d.id.clone();
+                match backend.fetch_logs(&d).await {
+                    Ok(text) => (id, text),
+                    Err(e) => (id, format!("error: {e}")),
+                }
+            }));
+        }
+
+        for h in handles {
+            if let Ok((id, text)) = h.await {
+                let text = text.trim();
+                if !text.is_empty() {
+                    for line in text.lines() {
+                        println!("[{id}] {line}");
+                    }
+                }
+            }
+        }
+
+        if !follow {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    Ok(())
+}
+
+async fn cmd_ota<B: DisplayBackend>(
     backend: &Arc<B>,
     firmware: &PathBuf,
     to: &str,
@@ -347,7 +403,9 @@ async fn cmd_ota<B: Updatable>(
         )));
     }
 
-    let displays = backend.discover(std::time::Duration::from_secs_f64(timeout)).await?;
+    let displays = backend
+        .discover(std::time::Duration::from_secs_f64(timeout))
+        .await?;
     let targets = backend.resolve_target(&displays, to)?;
 
     eprintln!(
@@ -358,8 +416,10 @@ async fn cmd_ota<B: Updatable>(
 
     for t in targets {
         eprintln!("  Updating {} ({})...", t.id, t.hostname);
-        let result = backend.update_firmware(t, firmware).await?;
-        println!("    {result}");
+        match backend.update_firmware(t, firmware).await {
+            Ok(msg) => println!("    {msg}"),
+            Err(e) => println!("    {}: error — {e}", t.id),
+        }
     }
     Ok(())
 }
@@ -377,6 +437,7 @@ async fn main() {
             preview,
         } => cmd_send(&backend, image, preview, cli.timeout, cli.saturation).await,
         Command::Preview { ref image } => cmd_preview(image, cli.saturation),
+        Command::Logs { follow } => cmd_logs(&backend, follow, cli.timeout).await,
         Command::Ota {
             ref firmware,
             ref to,

@@ -1,16 +1,14 @@
 // E-Ink Web Server — ED2208 7.3" Spectra 6 on EE04
 // Accepts 4bpp raw images via HTTP POST
-// Supports mDNS discovery, OTA updates, and fleet orchestration
-// python3 eink.py discover   # find displays on network
-// python3 eink.py send <image> --to all
+// Supports mDNS discovery and fleet orchestration
 
 #include <WiFi.h>
 #include <SPI.h>
 #include <ESPmDNS.h>
-#include <ArduinoOTA.h>
+#include <Update.h>
 
 // -------- CONFIG --------
-// TODO: I mean, obviously env variable opportunity 
+// TODO: I mean, obviously env variable opportunity
 // here once I figure out how to do that in a fricking arduino
 const char* ssid     = "WIFI-SSID";
 const char* password = "WIFI-PASSWORD";
@@ -30,7 +28,7 @@ const char* password = "WIFI-PASSWORD";
 
 // -------- BATTERY --------
 // XIAO ESP32-S3: enable voltage divider on GPIO14, read ADC on GPIO1 (A0)
-#define BATT_READ_ENABLE 14
+#define BATT_READ_ENABLE  6
 #define BATT_ADC_PIN      1
 
 float readBatteryVoltage() {
@@ -48,6 +46,71 @@ int batteryPercent(float voltage) {
   if (pct > 100) pct = 100;
   if (pct < 0) pct = 0;
   return pct;
+}
+
+// -------- LOG RING BUFFER --------
+#define LOG_BUF_SIZE 16384
+char logBuffer[LOG_BUF_SIZE];
+volatile size_t logHead = 0;  // next write position
+volatile size_t logUsed = 0;  // bytes in buffer
+
+void logBufferWrite(const char* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    logBuffer[logHead] = data[i];
+    logHead = (logHead + 1) % LOG_BUF_SIZE;
+    if (logUsed < LOG_BUF_SIZE) {
+      logUsed++;
+    }
+  }
+}
+
+// Read the ring buffer contents in order (oldest first)
+size_t logBufferRead(char* out, size_t maxLen) {
+  size_t toRead = (logUsed < maxLen) ? logUsed : maxLen;
+  if (toRead == 0) return 0;
+
+  size_t start;
+  if (logUsed < LOG_BUF_SIZE) {
+    start = 0;
+  } else {
+    start = logHead;  // oldest byte is at head (it wraps)
+  }
+
+  for (size_t i = 0; i < toRead; i++) {
+    out[i] = logBuffer[(start + i) % LOG_BUF_SIZE];
+  }
+  return toRead;
+}
+
+void logBufferClear() {
+  logHead = 0;
+  logUsed = 0;
+}
+
+// Log to both Serial and ring buffer
+void deviceLog(const char* fmt, ...) {
+  char buf[256];
+  int prefix = snprintf(buf, sizeof(buf), "[%lu] ", millis());
+
+  va_list args;
+  va_start(args, fmt);
+  int body = vsnprintf(buf + prefix, sizeof(buf) - prefix, fmt, args);
+  va_end(args);
+
+  int total = prefix + body;
+  if (total >= (int)sizeof(buf)) total = sizeof(buf) - 1;
+
+  // Add newline if not present
+  if (total > 0 && buf[total - 1] != '\n') {
+    if (total < (int)sizeof(buf) - 1) {
+      buf[total] = '\n';
+      total++;
+    }
+    buf[total] = '\0';
+  }
+
+  Serial.print(buf);
+  logBufferWrite(buf, total);
 }
 
 // Unique hostname derived from chip MAC
@@ -84,16 +147,16 @@ void epdCommandData(uint8_t cmd, const uint8_t* data, size_t len) {
 }
 
 void waitBusy(const char* msg, unsigned long timeout_ms = 30000) {
-  Serial.printf("  waiting: %s...", msg);
+  deviceLog("  waiting: %s...", msg);
   unsigned long start = millis();
   while (digitalRead(EPD_BUSY) == HIGH) {
     delay(10);
     if (millis() - start > timeout_ms) {
-      Serial.println(" TIMEOUT!");
+      deviceLog("  %s TIMEOUT after %lu ms", msg, millis() - start);
       return;
     }
   }
-  Serial.printf(" done (%lu ms)\n", millis() - start);
+  deviceLog("  %s done (%lu ms)", msg, millis() - start);
 }
 
 void epdInit() {
@@ -166,13 +229,13 @@ TaskHandle_t refreshTaskHandle = nullptr;
 
 // FreeRTOS task: runs display refresh on core 0 so the main loop stays responsive
 void refreshTask(void* param) {
-  Serial.printf("[%lu] Refresh task: starting on core %d\n", millis(), xPortGetCoreID());
+  deviceLog("refresh task: starting on core %d", xPortGetCoreID());
   unsigned long t = millis();
   epdInit();
   epdSendImage(imageBuffer, EXPECTED_SIZE);
   epdRefresh();
   epdSleep();
-  Serial.printf("[%lu] Refresh task: done in %lu ms\n", millis(), millis() - t);
+  deviceLog("refresh task: done in %lu ms", millis() - t);
   isUpdating = false;
   refreshTaskHandle = nullptr;
   vTaskDelete(NULL);
@@ -186,13 +249,12 @@ void setupWiFi() {
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  deviceLog("WiFi connected: %s", WiFi.localIP().toString().c_str());
 }
 
 void setupMDNS() {
   if (!MDNS.begin(hostname.c_str())) {
-    Serial.println("mDNS: FAILED to start");
+    deviceLog("mDNS: FAILED to start");
     return;
   }
   MDNS.addService("_eink", "_tcp", 80);
@@ -200,26 +262,7 @@ void setupMDNS() {
   MDNS.addServiceTxt("_eink", "_tcp", "width", String(WIDTH));
   MDNS.addServiceTxt("_eink", "_tcp", "height", String(HEIGHT));
   MDNS.addServiceTxt("_eink", "_tcp", "status", "ready");
-  Serial.printf("mDNS: %s.local  service: _eink._tcp\n", hostname.c_str());
-}
-
-void setupOTA() {
-  ArduinoOTA.setHostname(hostname.c_str());
-  ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
-  ArduinoOTA.onEnd([]()   { Serial.println("OTA: done, rebooting"); });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("OTA: %u%%\r", progress * 100 / total);
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA error %u: ", error);
-    if      (error == OTA_AUTH_ERROR)    Serial.println("auth failed");
-    else if (error == OTA_BEGIN_ERROR)   Serial.println("begin failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("connect failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("receive failed");
-    else if (error == OTA_END_ERROR)     Serial.println("end failed");
-  });
-  ArduinoOTA.begin();
-  Serial.println("OTA: ready");
+  deviceLog("mDNS: %s.local  service: _eink._tcp", hostname.c_str());
 }
 
 // Skip past HTTP headers (end at \r\n\r\n)
@@ -261,16 +304,16 @@ void sendJsonResponse(WiFiClient& client, const String& json) {
 void handleClient(WiFiClient& client) {
   unsigned long connTime = millis();
   String clientIP = client.remoteIP().toString();
-  Serial.printf("[%lu] Client %s connected (free heap: %u)\n", connTime, clientIP.c_str(), ESP.getFreeHeap());
+  deviceLog("client %s connected (free heap: %u)", clientIP.c_str(), ESP.getFreeHeap());
 
   // Read first line to determine request type
   String firstLine = client.readStringUntil('\n');
   firstLine.trim();
   String path = getPath(firstLine);
-  Serial.printf("[%lu] Request: %s (path: %s)\n", millis(), firstLine.c_str(), path.c_str());
+  deviceLog("request: %s (path: %s)", firstLine.c_str(), path.c_str());
 
   if (firstLine.length() == 0) {
-    Serial.printf("[%lu] WARNING: empty first line (client timeout or no data sent)\n", millis());
+    deviceLog("WARNING: empty first line (client timeout or no data sent)");
     client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nEmpty request\r\n");
     return;
   }
@@ -293,7 +336,31 @@ void handleClient(WiFiClient& client) {
                     ",\"percent\":" + String(battPct) + "}" +
                     ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       sendJsonResponse(client, json);
-      Serial.printf("[%lu] Sent /info response\n", millis());
+      return;
+    }
+
+    // /logs — return ring buffer contents
+    if (path.startsWith("/logs")) {
+      // Allocate temp buffer to read the log
+      char* tmp = (char*)malloc(logUsed + 1);
+      if (!tmp) {
+        client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nOut of memory\r\n");
+        return;
+      }
+      size_t len = logBufferRead(tmp, logUsed);
+      tmp[len] = '\0';
+
+      client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
+      client.print(len);
+      client.print("\r\nConnection: close\r\n\r\n");
+      client.write((uint8_t*)tmp, len);
+
+      // Clear buffer if ?clear=1
+      if (path.indexOf("clear=1") >= 0) {
+        logBufferClear();
+      }
+
+      free(tmp);
       return;
     }
 
@@ -305,7 +372,9 @@ void handleClient(WiFiClient& client) {
       "Hostname: " + hostname + ".local\r\n"
       "Status: " + status + "\r\n"
       "POST 192000 bytes of 4bpp raw data to /display\r\n"
-      "Colors: 0=white 1=black 2=green 3=blue 5=yellow 6=red\r\n";
+      "GET /info — JSON status\r\n"
+      "GET /logs — device logs\r\n"
+      "GET /logs?clear=1 — device logs (clear after read)\r\n";
     client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
     client.print(body.length());
     client.print("\r\nConnection: close\r\n\r\n");
@@ -315,25 +384,96 @@ void handleClient(WiFiClient& client) {
 
   if (!firstLine.startsWith("POST")) {
     skipHeaders(client);
-    Serial.printf("[%lu] Rejected: method not allowed\n", millis());
+    deviceLog("rejected: method not allowed");
     client.print("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
     return;
   }
 
   if (isUpdating) {
     skipHeaders(client);
-    Serial.printf("[%lu] Rejected: display is busy refreshing\n", millis());
+    deviceLog("rejected: display is busy refreshing");
     client.print("HTTP/1.1 503 Busy\r\nConnection: close\r\n\r\nDisplay is refreshing\r\n");
     return;
   }
 
   // Skip HTTP headers to get to the body
   if (!skipHeaders(client)) {
-    Serial.printf("[%lu] ERROR: timed out reading HTTP headers\n", millis());
+    deviceLog("ERROR: timed out reading HTTP headers");
     client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nTimeout reading headers\r\n");
     return;
   }
-  Serial.printf("[%lu] Headers parsed OK\n", millis());
+  deviceLog("headers parsed OK");
+
+  // -------- POST /ota — HTTP firmware update --------
+  if (path == "/ota") {
+    deviceLog("OTA: starting firmware update");
+
+    // Read firmware into a temp buffer (max 2MB)
+    const size_t MAX_FW_SIZE = 2 * 1024 * 1024;
+    uint8_t* fwBuf = (uint8_t*)ps_malloc(MAX_FW_SIZE);
+    if (!fwBuf) fwBuf = (uint8_t*)malloc(MAX_FW_SIZE);
+    if (!fwBuf) {
+      deviceLog("OTA: out of memory");
+      client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nOut of memory\r\n");
+      return;
+    }
+
+    size_t received = 0;
+    unsigned long start = millis();
+    while ((millis() - start) < 60000) {
+      if (client.available()) {
+        size_t chunk = client.read(fwBuf + received, MAX_FW_SIZE - received);
+        received += chunk;
+        if (received >= MAX_FW_SIZE) break;
+        start = millis();  // reset timeout on data received
+      } else if (received > 0 && !client.connected()) {
+        break;  // client done sending
+      } else {
+        delay(1);
+      }
+    }
+
+    deviceLog("OTA: received %u bytes in %lu ms", received, millis() - start);
+
+    if (received == 0) {
+      free(fwBuf);
+      client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nNo firmware data\r\n");
+      return;
+    }
+
+    if (!Update.begin(received)) {
+      deviceLog("OTA: Update.begin failed");
+      free(fwBuf);
+      client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nUpdate.begin failed\r\n");
+      return;
+    }
+
+    size_t written = Update.write(fwBuf, received);
+    free(fwBuf);
+
+    if (written != received) {
+      deviceLog("OTA: write mismatch (wrote %u / %u)", written, received);
+      Update.abort();
+      client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nWrite failed\r\n");
+      return;
+    }
+
+    if (!Update.end(true)) {
+      deviceLog("OTA: Update.end failed");
+      client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nUpdate.end failed\r\n");
+      return;
+    }
+
+    deviceLog("OTA: success! Rebooting...");
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOTA OK — rebooting\r\n");
+    client.flush();
+    client.stop();
+    delay(500);
+    ESP.restart();
+    return;
+  }
+
+  // -------- POST /display — image upload --------
 
   // Allocate buffer if needed
   if (!imageBuffer) {
@@ -341,7 +481,7 @@ void handleClient(WiFiClient& client) {
     if (!imageBuffer) imageBuffer = (uint8_t*)malloc(EXPECTED_SIZE);
   }
   if (!imageBuffer) {
-    Serial.printf("[%lu] ERROR: failed to allocate %u bytes\n", millis(), EXPECTED_SIZE);
+    deviceLog("ERROR: failed to allocate %u bytes", EXPECTED_SIZE);
     client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nOut of memory\r\n");
     return;
   }
@@ -354,7 +494,7 @@ void handleClient(WiFiClient& client) {
       size_t chunk = client.read(imageBuffer + received, EXPECTED_SIZE - received);
       received += chunk;
       if (received % 48000 < chunk) {
-        Serial.printf("[%lu]   body: %u / %u bytes (%u%%)\n", millis(), received, EXPECTED_SIZE, received * 100 / EXPECTED_SIZE);
+        deviceLog("  body: %u / %u bytes (%u%%)", received, EXPECTED_SIZE, received * 100 / EXPECTED_SIZE);
       }
     } else {
       delay(1);
@@ -362,10 +502,10 @@ void handleClient(WiFiClient& client) {
   }
 
   unsigned long recvMs = millis() - start;
-  Serial.printf("[%lu] Received %u / %u bytes in %lu ms\n", millis(), received, EXPECTED_SIZE, recvMs);
+  deviceLog("received %u / %u bytes in %lu ms", received, EXPECTED_SIZE, recvMs);
 
   if (received != EXPECTED_SIZE) {
-    Serial.printf("[%lu] ERROR: bad body size (got %u, need %u)\n", millis(), received, EXPECTED_SIZE);
+    deviceLog("ERROR: bad body size (got %u, need %u)", received, EXPECTED_SIZE);
     String msg = "Bad size: got " + String(received) + ", need " + String(EXPECTED_SIZE) + "\r\n";
     client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
     client.print(msg);
@@ -376,7 +516,7 @@ void handleClient(WiFiClient& client) {
   client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK — refreshing display\r\n");
   client.flush();
   client.stop();
-  Serial.printf("[%lu] Response sent, connection closed (total request: %lu ms)\n", millis(), millis() - connTime);
+  deviceLog("response sent, connection closed (total request: %lu ms)", millis() - connTime);
 
   // Start display refresh in a background FreeRTOS task so loop() stays responsive
   isUpdating = true;
@@ -411,20 +551,17 @@ void setup() {
 
   setupWiFi();
   setupMDNS();
-  setupOTA();
   tcpServer.begin();
 
-  Serial.printf("Ready! http://%s.local/info\n", hostname.c_str());
+  deviceLog("ready: http://%s.local/info", hostname.c_str());
 }
 
 void loop() {
-  ArduinoOTA.handle();
-
   // Reconnect WiFi if dropped
   if (millis() - lastWifiCheck > 10000) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.printf("[%lu] WiFi disconnected! Reconnecting...\n", millis());
+      deviceLog("WiFi disconnected! Reconnecting...");
       WiFi.disconnect();
       WiFi.begin(ssid, password);
       unsigned long wifiStart = millis();
@@ -432,19 +569,17 @@ void loop() {
         delay(250);
       }
       if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[%lu] WiFi reconnected: %s\n", millis(), WiFi.localIP().toString().c_str());
+        deviceLog("WiFi reconnected: %s", WiFi.localIP().toString().c_str());
       } else {
-        Serial.printf("[%lu] WiFi reconnect failed\n", millis());
+        deviceLog("WiFi reconnect failed");
       }
     }
   }
 
   WiFiClient client = tcpServer.available();
   if (client) {
-    Serial.printf("[%lu] --- New connection ---\n", millis());
     handleClient(client);
     client.stop();
-    Serial.printf("[%lu] --- Connection closed ---\n", millis());
   }
   delay(2);
 }

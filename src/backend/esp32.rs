@@ -9,9 +9,9 @@ use crate::discovery::DisplayInfo;
 use crate::error::{PaintressError, Result};
 use crate::image::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
 
-use super::{DisplayBackend, Updatable};
+use super::DisplayBackend;
 
-/// ESP32-based backend: mDNS discovery, HTTP transport, espota/esptool OTA.
+/// ESP32-based backend: mDNS discovery, HTTP transport.
 pub struct Esp32Backend;
 
 impl Esp32Backend {
@@ -76,18 +76,36 @@ impl DisplayBackend for Esp32Backend {
         let body = resp.text().await.unwrap_or_default();
         Ok(format!("{}: {status} — {}", display.id, body.trim()))
     }
-}
 
-impl Updatable for Esp32Backend {
-    async fn update_firmware(&self, display: &DisplayInfo, firmware: &PathBuf) -> Result<String> {
-        let hostname = display.hostname.clone();
-        let id = display.id.clone();
-        let firmware = firmware.clone();
-
-        // Subprocess spawning is blocking — offload it.
-        tokio::task::spawn_blocking(move || ota_update(&id, &hostname, &firmware))
+    async fn fetch_logs(&self, display: &DisplayInfo) -> Result<String> {
+        let url = format!("http://{}:{}/logs?clear=1", display.ip, display.port);
+        let resp = reqwest::get(&url)
             .await
-            .map_err(|e| PaintressError::Generic(format!("spawn_blocking: {e}")))?
+            .map_err(|e| PaintressError::Generic(format!("{}: {e}", display.id)))?;
+        let text = resp.text().await.unwrap_or_default();
+        Ok(text)
+    }
+
+    async fn update_firmware(&self, display: &DisplayInfo, firmware: &PathBuf) -> Result<String> {
+        let data = std::fs::read(firmware)
+            .map_err(|e| PaintressError::Generic(format!("read firmware: {e}")))?;
+        let size = data.len();
+        let url = format!("http://{}:{}/ota", display.ip, display.port);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(data)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok(format!(
+            "{}: {status} — {} ({size} bytes)",
+            display.id,
+            body.trim()
+        ))
     }
 }
 
@@ -166,48 +184,4 @@ fn discover_mdns(timeout: Duration) -> Result<Vec<DisplayInfo>> {
     }
     result.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
-}
-
-/// Blocking OTA update (runs on the blocking threadpool).
-fn ota_update(id: &str, hostname: &str, firmware: &PathBuf) -> Result<String> {
-    // Try espota.py first (Arduino IDE tool)
-    let result = std::process::Command::new("espota.py")
-        .args(["-i", hostname, "-p", "3232", "-f"])
-        .arg(firmware)
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => Ok(format!("{id}: OK")),
-        _ => {
-            // Fallback: esptool via python module
-            let result = std::process::Command::new("python3")
-                .args([
-                    "-m",
-                    "esptool",
-                    "--chip",
-                    "esp32s3",
-                    "--port",
-                    hostname,
-                    "write_flash",
-                    "0x10000",
-                ])
-                .arg(firmware)
-                .output()?;
-
-            if result.status.success() {
-                Ok(format!("{id}: OK"))
-            } else {
-                let err = String::from_utf8_lossy(&result.stderr);
-                let out = String::from_utf8_lossy(&result.stdout);
-                Ok(format!(
-                    "{id}: FAILED — {}",
-                    if err.is_empty() {
-                        out.trim().to_string()
-                    } else {
-                        err.trim().to_string()
-                    }
-                ))
-            }
-        }
-    }
 }
