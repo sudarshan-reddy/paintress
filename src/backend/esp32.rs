@@ -107,6 +107,22 @@ impl DisplayBackend for Esp32Backend {
             body.trim()
         ))
     }
+
+    async fn send_sleep(&self, display: &DisplayInfo, seconds: u32) -> Result<String> {
+        let url = format!(
+            "http://{}:{}/sleep?seconds={}",
+            display.ip, display.port, seconds
+        );
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok(format!("{}: {status} — {}", display.id, body.trim()))
+    }
 }
 
 /// Blocking mDNS discovery (runs on the blocking threadpool).
