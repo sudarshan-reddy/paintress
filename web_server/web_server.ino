@@ -27,17 +27,46 @@ const char* password = "WIFI-PASSWORD";
 #define HEIGHT 480
 
 // -------- BATTERY --------
-// XIAO ESP32-S3: enable voltage divider on GPIO14, read ADC on GPIO1 (A0)
+// EN04 voltage divider: R28=10K, R29=10K → BAT_ADC on GPIO1 (D0/A0)
+// ADC_EN on GPIO6 (D5/A5) — 100K pull-down
 #define BATT_READ_ENABLE  6
 #define BATT_ADC_PIN      1
 
 float readBatteryVoltage() {
+  // Try with enable pin high
   digitalWrite(BATT_READ_ENABLE, HIGH);
-  delay(10);  // let ADC settle
+  delay(10);
   uint32_t raw = analogReadMilliVolts(BATT_ADC_PIN);
   digitalWrite(BATT_READ_ENABLE, LOW);
   // Voltage divider halves the battery voltage
   return (raw * 2.0f) / 1000.0f;
+}
+
+// Debug: read raw millivolts from several candidate pins
+String batteryDebug() {
+  digitalWrite(BATT_READ_ENABLE, HIGH);
+  delay(10);
+  uint32_t g1  = analogReadMilliVolts(1);
+  uint32_t g2  = analogReadMilliVolts(2);
+  uint32_t g3  = analogReadMilliVolts(3);
+  uint32_t g4  = analogReadMilliVolts(4);
+  uint32_t g5  = analogReadMilliVolts(5);
+  uint32_t g6  = analogReadMilliVolts(6);
+  uint32_t g7  = analogReadMilliVolts(7);
+  uint32_t g8  = analogReadMilliVolts(8);
+  uint32_t g9  = analogReadMilliVolts(9);
+  uint32_t g10 = analogReadMilliVolts(10);
+  digitalWrite(BATT_READ_ENABLE, LOW);
+  return "\"adc_debug\":{\"gpio1\":" + String(g1) +
+         ",\"gpio2\":" + String(g2) +
+         ",\"gpio3\":" + String(g3) +
+         ",\"gpio4\":" + String(g4) +
+         ",\"gpio5\":" + String(g5) +
+         ",\"gpio6\":" + String(g6) +
+         ",\"gpio7\":" + String(g7) +
+         ",\"gpio8\":" + String(g8) +
+         ",\"gpio9\":" + String(g9) +
+         ",\"gpio10\":" + String(g10) + "}";
 }
 
 int batteryPercent(float voltage) {
@@ -334,6 +363,7 @@ void handleClient(WiFiClient& client) {
                     ",\"uptime\":" + String(millis() / 1000) +
                     ",\"battery\":{\"voltage\":" + String(battV, 2) +
                     ",\"percent\":" + String(battPct) + "}" +
+                    "," + batteryDebug() +
                     ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       sendJsonResponse(client, json);
       return;
