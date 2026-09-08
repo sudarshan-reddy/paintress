@@ -392,7 +392,8 @@ bool allocImageBuffer() {
 }
 
 
-// FreeRTOS task: runs display refresh on core 0 so the main loop stays responsivevoid refreshTask(void* param) {
+// FreeRTOS task: runs display refresh on core 0 so the main loop stays responsive
+void refreshTask(void* param) {
   deviceLog("refresh task: starting on core %d", xPortGetCoreID());
   // Battery is logged either side of the refresh: a panel that browns out
   // mid-refresh shows up as a sag here, and explains run-to-run variance
