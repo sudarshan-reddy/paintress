@@ -152,7 +152,6 @@ impl IndexedImage {
                 1 => Color::White,
                 2 => Color::Yellow,
                 3 => Color::Red,
-                4 => Color::Orange,
                 5 => Color::Blue,
                 6 => Color::Green,
                 _ => Color::White,

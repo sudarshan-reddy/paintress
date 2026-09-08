@@ -1,4 +1,4 @@
-// E-Ink Web Server — ED2208 7.3" Spectra 6 on EE04
+// E-Ink Web Server — T133A01 13.3" Spectra 6 on EE02
 // Accepts 4bpp raw images via HTTP POST
 // Supports mDNS discovery and fleet orchestration
 
@@ -17,17 +17,21 @@ const char* ssid     = "WIFI-SSID";
 const char* password = "WIFI-PASSWORD";
 
 
-// EE04 pin mapping for XIAO ESP32-S3 Plus
+// EE02 pin mapping for XIAO ESP32-S3 Plus.
+// Same as the EE04 (7.3") board except EPD_CS1 — the 13.3" panel has two
+// driver ICs and needs a second chip select. Source: Seeed_GFX
+// User_Setups/EPaper_Board_Pins_Setups.h, USE_XIAO_EPAPER_DISPLAY_BOARD_EE02.
 #define EPD_SCK     7   // D8
 #define EPD_MOSI    9   // D10
-#define EPD_CS     44   // D7
+#define EPD_CS     44   // D7  — master controller
+#define EPD_CS1    41   //     — slave controller (EE02 only)
 #define EPD_DC     10   // D16
 #define EPD_RST    38   // D11
 #define EPD_BUSY    4   // D3
 #define EPD_ENABLE 43   // D6
 
-#define WIDTH  800
-#define HEIGHT 480
+#define WIDTH  1200
+#define HEIGHT 1600
 
 // -------- BATTERY --------
 // EN04 voltage divider: R28=10K, R29=10K → BAT_ADC on GPIO1 (D0/A0)
@@ -157,103 +161,199 @@ String getChipId() {
   return String(buf);
 }
 
-// -------- ED2208 DRIVER --------
+// -------- T133A01 DRIVER (13.3" Spectra 6, dual controller) --------
+// Transcribed from Seeed_GFX TFT_Drivers/T133A01_Defines.h. The register
+// values are vendor-supplied panel tuning — do not "clean them up".
+//
+// The EE02 carries two driver ICs sharing SCK/MOSI/DC/RST/BUSY:
+//   EPD_CS  low, EPD_CS1 high  -> master only
+//   EPD_CS  high, EPD_CS1 low  -> slave only
+//   both low                   -> broadcast (same config into both)
+// Power and boost registers go to the master alone; timing and resolution
+// are broadcast. The framebuffer is split left/right, not top/bottom.
 
-void epdCommand(uint8_t cmd) {
+#define R00_PSR    0x00
+#define R01_PWR    0x01
+#define R02_POF    0x02
+#define R04_PON    0x04
+#define R05_BTST_N 0x05
+#define R06_BTST_P 0x06
+#define R10_DTM    0x10
+#define R12_DRF    0x12
+#define R30_PLL    0x30
+#define R50_CDI    0x50
+#define R61_TRES   0x61
+#define RA5_DCDC   0xA5
+#define RE0_CCSET  0xE0
+#define RE3_PWS    0xE3
+
+static const uint8_t V_R74[9]    = {0x00, 0x0C, 0x0C, 0xD9, 0xDD, 0xDD, 0x15, 0x15, 0x55};
+static const uint8_t V_RF0[6]    = {0x49, 0x55, 0x13, 0x5D, 0x05, 0x10};
+static const uint8_t V_PSR[2]    = {0xDF, 0x69};
+static const uint8_t V_PLL[1]    = {0x08};
+static const uint8_t V_DCDC[3]   = {0x44, 0x54, 0x00};
+static const uint8_t V_CDI[1]    = {0x37};
+static const uint8_t V_R60[2]    = {0x03, 0x03};
+static const uint8_t V_R86[1]    = {0x10};
+static const uint8_t V_PWS[1]    = {0x22};
+static const uint8_t V_TRES[4]   = {0x04, 0xB0, 0x03, 0x20};
+static const uint8_t V_PWR[6]    = {0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38};
+static const uint8_t V_RB6[1]    = {0x07};
+static const uint8_t V_BTST_P[2] = {0xE0, 0x20};
+static const uint8_t V_RB7[1]    = {0x01};
+static const uint8_t V_BTST_N[2] = {0xE0, 0x20};
+static const uint8_t V_RB0[1]    = {0x01};
+static const uint8_t V_RB1[1]    = {0x02};
+static const uint8_t V_CCSET[1]  = {0x01};
+static const uint8_t V_DRF[1]    = {0x00};
+static const uint8_t V_POF[1]    = {0x00};
+static const uint8_t V_SLEEP[1]  = {0xA5};
+
+static const SPISettings EPD_SPI(10000000, MSBFIRST, SPI_MODE0);
+
+// 4bpp: two pixels per byte. Each controller takes half of every row.
+static const size_t ROW_BYTES      = WIDTH / 2;  // 600
+static const size_t HALF_ROW_BYTES = WIDTH / 4;  // 300 = 600 px
+
+// Pulses EPD_CS around one command + its data. The slave also latches when the
+// caller is holding EPD_CS1 low, which is how broadcast writes are done.
+void epdCmd(uint8_t cmd, const uint8_t* data = nullptr, size_t len = 0) {
+  SPI.beginTransaction(EPD_SPI);
   digitalWrite(EPD_DC, LOW);
   digitalWrite(EPD_CS, LOW);
   SPI.transfer(cmd);
-  digitalWrite(EPD_CS, HIGH);
-}
-
-void epdData(uint8_t d) {
   digitalWrite(EPD_DC, HIGH);
-  digitalWrite(EPD_CS, LOW);
-  SPI.transfer(d);
+  for (size_t i = 0; i < len; i++) SPI.transfer(data[i]);
   digitalWrite(EPD_CS, HIGH);
+  SPI.endTransaction();
 }
 
-void epdCommandData(uint8_t cmd, const uint8_t* data, size_t len) {
-  epdCommand(cmd);
-  for (size_t i = 0; i < len; i++) epdData(data[i]);
+// Same, but both controllers latch it.
+void epdCmdBoth(uint8_t cmd, const uint8_t* data = nullptr, size_t len = 0) {
+  digitalWrite(EPD_CS1, LOW);
+  epdCmd(cmd, data, len);
+  digitalWrite(EPD_CS1, HIGH);
 }
 
-void waitBusy(const char* msg, unsigned long timeout_ms = 30000) {
-  deviceLog("  waiting: %s...", msg);
+// Returns true if the panel went idle, false on timeout.
+// BUSY is LOW while the panel is working and HIGH when idle — this is the
+// opposite of the old ED2208 code here, and matches Seeed_GFX's CHECK_BUSY,
+// which spins until digitalRead(TFT_BUSY) is non-zero.
+bool waitBusy(const char* msg, unsigned long timeout_ms = 30000) {
+  deviceLog("  waiting: %s... (BUSY=%d at entry)", msg, digitalRead(EPD_BUSY));
+
   unsigned long start = millis();
-  while (digitalRead(EPD_BUSY) == HIGH) {
+  unsigned long lastLog = start;
+
+  while (digitalRead(EPD_BUSY) == LOW) {
     delay(10);
+    if (millis() - lastLog >= 5000) {
+      lastLog = millis();
+      deviceLog("    %s: %lu ms elapsed", msg, millis() - start);
+    }
     if (millis() - start > timeout_ms) {
-      deviceLog("  %s TIMEOUT after %lu ms", msg, millis() - start);
-      return;
+      deviceLog("  %s TIMEOUT after %lu ms (BUSY still LOW)", msg, millis() - start);
+      return false;
     }
   }
   deviceLog("  %s done (%lu ms)", msg, millis() - start);
+  return true;
 }
 
-void epdInit() {
+bool epdInit() {
+  digitalWrite(EPD_CS1, HIGH);
   digitalWrite(EPD_RST, LOW);
   delay(20);
   digitalWrite(EPD_RST, HIGH);
+  delay(20);
+  if (!waitBusy("reset", 10000)) return false;
+
+  epdCmd    (0x74,       V_R74,    sizeof(V_R74));     // master only
+  epdCmdBoth(0xF0,       V_RF0,    sizeof(V_RF0));
+  epdCmdBoth(R00_PSR,    V_PSR,    sizeof(V_PSR));
+  epdCmdBoth(R30_PLL,    V_PLL,    sizeof(V_PLL));
+  epdCmd    (RA5_DCDC,   V_DCDC,   sizeof(V_DCDC));    // master only
+  epdCmdBoth(R50_CDI,    V_CDI,    sizeof(V_CDI));
+  epdCmdBoth(0x60,       V_R60,    sizeof(V_R60));
+  epdCmdBoth(0x86,       V_R86,    sizeof(V_R86));
+  epdCmdBoth(RE3_PWS,    V_PWS,    sizeof(V_PWS));
+  epdCmdBoth(R61_TRES,   V_TRES,   sizeof(V_TRES));
+  epdCmd    (R01_PWR,    V_PWR,    sizeof(V_PWR));     // master only from here
+  epdCmd    (0xB6,       V_RB6,    sizeof(V_RB6));
+  epdCmd    (R06_BTST_P, V_BTST_P, sizeof(V_BTST_P));
+  epdCmd    (0xB7,       V_RB7,    sizeof(V_RB7));
+  epdCmd    (R05_BTST_N, V_BTST_N, sizeof(V_BTST_N));
+  epdCmd    (0xB0,       V_RB0,    sizeof(V_RB0));
+  epdCmd    (0xB1,       V_RB1,    sizeof(V_RB1));
+  return true;
+}
+
+// Stream one controller's half of the framebuffer: `colOffset` bytes into each
+// row, HALF_ROW_BYTES wide, for every row. Bulk writeBytes per row — a
+// per-byte SPI.transfer loop over 480 KB would add tens of seconds.
+static void epdSendHalf(int csPin, const uint8_t* data, size_t colOffset) {
+  SPI.beginTransaction(EPD_SPI);
+  digitalWrite(csPin, LOW);
+  digitalWrite(EPD_DC, LOW);
+  SPI.transfer(R10_DTM);
+  digitalWrite(EPD_DC, HIGH);
+  for (uint16_t row = 0; row < HEIGHT; row++) {
+    SPI.writeBytes(data + (size_t)row * ROW_BYTES + colOffset, HALF_ROW_BYTES);
+  }
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+}
+
+// `data` is already in panel colour codes (paintress dithers host-side), so
+// unlike Seeed_GFX there is no COLOR_GET palette translation here.
+void epdSendImage(const uint8_t* data, size_t len) {
+  if (len != (size_t)ROW_BYTES * HEIGHT) {
+    deviceLog("epdSendImage: refusing %u bytes, panel needs %u", len, ROW_BYTES * HEIGHT);
+    return;
+  }
+
+  epdCmdBoth(RE0_CCSET, V_CCSET, sizeof(V_CCSET));
+  waitBusy("ccset", 10000);
   delay(10);
 
-  uint8_t cmdh[] = {0x49, 0x55, 0x20, 0x08, 0x09, 0x18};
-  epdCommandData(0xAA, cmdh, 6);
-  uint8_t pwr[] = {0x3F, 0x00, 0x32, 0x2A, 0x0E, 0x2A};
-  epdCommandData(0x01, pwr, 6);
-  uint8_t psr[] = {0x5F, 0x69};
-  epdCommandData(0x00, psr, 2);
-  uint8_t pofs[] = {0x00, 0x54, 0x00, 0x44};
-  epdCommandData(0x03, pofs, 4);
-  uint8_t btst1[] = {0x40, 0x1F, 0x1F, 0x2C};
-  epdCommandData(0x05, btst1, 4);
-  uint8_t btst2[] = {0x6F, 0x1F, 0x16, 0x25};
-  epdCommandData(0x06, btst2, 4);
-  uint8_t btst3[] = {0x6F, 0x1F, 0x1F, 0x22};
-  epdCommandData(0x08, btst3, 4);
-  uint8_t ipc[] = {0x00, 0x04};
-  epdCommandData(0x13, ipc, 2);
-  epdCommand(0x30); epdData(0x02);
-  epdCommand(0x41); epdData(0x00);
-  epdCommand(0x50); epdData(0x3F);
-  uint8_t tcon[] = {0x02, 0x00};
-  epdCommandData(0x60, tcon, 2);
-  uint8_t tres[] = {0x03, 0x20, 0x01, 0xE0};
-  epdCommandData(0x61, tres, 4);
-  epdCommand(0x82); epdData(0x1E);
-  epdCommand(0x84); epdData(0x01);
-  epdCommand(0x86); epdData(0x00);
-  epdCommand(0xE3); epdData(0x2F);
-  epdCommand(0xE0); epdData(0x00);
-  epdCommand(0xE6); epdData(0x00);
-  epdCommand(0x04);
-  waitBusy("power on", 180000);
+  epdSendHalf(EPD_CS,  data, 0);               // master: left 600 px of each row
+  epdSendHalf(EPD_CS1, data, HALF_ROW_BYTES);  // slave:  right 600 px
 }
 
-void epdSendImage(const uint8_t* data, size_t len) {
-  epdCommand(0x10);
-  digitalWrite(EPD_DC, HIGH);
-  digitalWrite(EPD_CS, LOW);
-  for (size_t i = 0; i < len; i++) SPI.transfer(data[i]);
-  digitalWrite(EPD_CS, HIGH);
-}
+bool epdRefresh() {
+  bool ok = true;
 
-void epdRefresh() {
-  epdCommand(0x12);
-  epdData(0x00);
-  waitBusy("refresh", 60000);
+  digitalWrite(EPD_CS1, LOW);
+  epdCmd(R04_PON);
+  ok &= waitBusy("power on", 60000);
+  digitalWrite(EPD_CS1, HIGH);
+  delay(30);
+
+  digitalWrite(EPD_CS1, LOW);
+  epdCmd(R12_DRF, V_DRF, sizeof(V_DRF));
+  ok &= waitBusy("refresh", 180000);  // 13.3" full refresh is tens of seconds
+  digitalWrite(EPD_CS1, HIGH);
+  delay(30);
+
+  digitalWrite(EPD_CS1, LOW);
+  epdCmd(R02_POF, V_POF, sizeof(V_POF));
+  ok &= waitBusy("power off", 60000);
+  digitalWrite(EPD_CS1, HIGH);
+  delay(30);
+
+  return ok;
 }
 
 void epdSleep() {
-  epdCommand(0x02);
-  epdData(0x00);
-  waitBusy("power off", 30000);
+  epdCmd(0x07, V_SLEEP, sizeof(V_SLEEP));
+  delay(1);
+  waitBusy("sleep", 10000);
 }
 
 // -------- TCP SERVER --------
 WiFiServer tcpServer(80);
 
-const size_t EXPECTED_SIZE = (WIDTH * HEIGHT) / 2;  // 192000
+const size_t EXPECTED_SIZE = (WIDTH * HEIGHT) / 2;  // 960000 — needs PSRAM
 uint8_t* imageBuffer = nullptr;
 volatile bool isUpdating = false;
 unsigned long lastWifiCheck = 0;
@@ -262,12 +362,47 @@ TaskHandle_t refreshTaskHandle = nullptr;
 // FreeRTOS task: runs display refresh on core 0 so the main loop stays responsive
 void refreshTask(void* param) {
   deviceLog("refresh task: starting on core %d", xPortGetCoreID());
+  // Battery is logged either side of the refresh: a panel that browns out
+  // mid-refresh shows up as a sag here, and explains run-to-run variance
+  // that a pure logic bug could not.
+  deviceLog("  before: battery=%d mV BUSY=%d heap=%u",
+            (int)(readBatteryVoltage() * 1000.0f), digitalRead(EPD_BUSY), ESP.getFreeHeap());
+
   unsigned long t = millis();
-  epdInit();
+  unsigned long t0;
+
+  t0 = millis();
+  bool initOk = epdInit();
+  unsigned long tInit = millis() - t0;
+
+  // If the panel never released BUSY after reset it is not talking to us, and
+  // pushing 960 KB into it just wastes 30 s and a battery. Bail early and say so.
+  if (!initOk) {
+    deviceLog("refresh task: ABORTED — panel did not come out of reset (%lu ms)", tInit);
+    isUpdating = false;
+    refreshTaskHandle = nullptr;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  t0 = millis();
   epdSendImage(imageBuffer, EXPECTED_SIZE);
-  epdRefresh();
+  unsigned long tSend = millis() - t0;
+
+  t0 = millis();
+  bool refreshOk = epdRefresh();
+  unsigned long tRefresh = millis() - t0;
+
+  t0 = millis();
   epdSleep();
-  deviceLog("refresh task: done in %lu ms", millis() - t);
+  unsigned long tSleep = millis() - t0;
+
+  deviceLog("refresh task: init=%lu send=%lu refresh=%lu sleep=%lu total=%lu ms (%s)",
+            tInit, tSend, tRefresh, tSleep, millis() - t,
+            refreshOk ? "OK" : "REFRESH TIMED OUT");
+  deviceLog("  after:  battery=%d mV BUSY=%d",
+            (int)(readBatteryVoltage() * 1000.0f), digitalRead(EPD_BUSY));
+
   isUpdating = false;
   refreshTaskHandle = nullptr;
   vTaskDelete(NULL);
@@ -400,11 +535,11 @@ void handleClient(WiFiClient& client) {
     // Default GET — human-readable status page
     String status = isUpdating ? "BUSY" : "READY";
     String body =
-      "E-Ink Display Server (ED2208 Spectra 6)\r\n"
+      "E-Ink Display Server (T133A01 13.3\" Spectra 6)\r\n"
       "ID: " + chipId + "\r\n"
       "Hostname: " + hostname + ".local\r\n"
       "Status: " + status + "\r\n"
-      "POST 192000 bytes of 4bpp raw data to /display\r\n"
+      "POST " + String(EXPECTED_SIZE) + " bytes of 4bpp raw data to /display\r\n"
       "GET /info — JSON status\r\n"
       "GET /logs — device logs\r\n"
       "GET /logs?clear=1 — device logs (clear after read)\r\n";
@@ -522,11 +657,14 @@ void handleClient(WiFiClient& client) {
   // Read image body
   size_t received = 0;
   unsigned long start = millis();
+  // 960 KB over WiFi with light sleep enabled can take a while; the deadline is
+  // per-stall, not for the whole body, matching the OTA path above.
   while (received < EXPECTED_SIZE && (millis() - start) < 30000) {
     if (client.available()) {
       size_t chunk = client.read(imageBuffer + received, EXPECTED_SIZE - received);
       received += chunk;
-      if (received % 48000 < chunk) {
+      start = millis();
+      if (received % (EXPECTED_SIZE / 8) < chunk) {
         deviceLog("  body: %u / %u bytes (%u%%)", received, EXPECTED_SIZE, received * 100 / EXPECTED_SIZE);
       }
     } else {
@@ -563,23 +701,26 @@ void setup() {
   chipId = getChipId();
   hostname = "eink-" + chipId;
 
-  Serial.println("E-Ink Web Server — ED2208 Spectra 6 on EE04");
+  Serial.println("E-Ink Web Server — T133A01 13.3\" Spectra 6 on EE02");
   Serial.printf("Chip ID: %s  Hostname: %s\n", chipId.c_str(), hostname.c_str());
 
   pinMode(EPD_ENABLE, OUTPUT);
   digitalWrite(EPD_ENABLE, HIGH);
   pinMode(EPD_CS, OUTPUT);
+  pinMode(EPD_CS1, OUTPUT);
   pinMode(EPD_DC, OUTPUT);
   pinMode(EPD_RST, OUTPUT);
   pinMode(EPD_BUSY, INPUT);
   digitalWrite(EPD_CS, HIGH);
+  digitalWrite(EPD_CS1, HIGH);
 
   pinMode(BATT_READ_ENABLE, OUTPUT);
   digitalWrite(BATT_READ_ENABLE, LOW);
   analogReadResolution(12);
 
+  // The driver opens a transaction per transfer, which also takes the power
+  // management lock it needs while light sleep is enabled.
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
   delay(100);
 
   setupWiFi();
