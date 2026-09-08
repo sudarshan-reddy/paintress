@@ -359,8 +359,40 @@ volatile bool isUpdating = false;
 unsigned long lastWifiCheck = 0;
 TaskHandle_t refreshTaskHandle = nullptr;
 
-// FreeRTOS task: runs display refresh on core 0 so the main loop stays responsive
-void refreshTask(void* param) {
+// The 1200x1600 framebuffer is 960 KB and only fits in PSRAM — the S3 has
+// nowhere near that in DRAM. Allocated once and kept for the life of the
+// process. Logs enough to tell "PSRAM off in the build" apart from
+// "PSRAM present but exhausted", which the old message could not.
+bool allocImageBuffer() {
+  if (imageBuffer) return true;
+
+  imageBuffer = (uint8_t*)ps_malloc(EXPECTED_SIZE);
+  if (imageBuffer) {
+    deviceLog("framebuffer: %u bytes in PSRAM (%u of %u free)",
+              EXPECTED_SIZE, ESP.getFreePsram(), ESP.getPsramSize());
+    return true;
+  }
+
+  imageBuffer = (uint8_t*)malloc(EXPECTED_SIZE);
+  if (imageBuffer) {
+    deviceLog("framebuffer: %u bytes in DRAM (no PSRAM!)", EXPECTED_SIZE);
+    return true;
+  }
+
+  deviceLog("ERROR: cannot allocate %u byte framebuffer", EXPECTED_SIZE);
+  deviceLog("  psramFound=%d psramSize=%u psramFree=%u heapFree=%u largestBlock=%u",
+            psramFound() ? 1 : 0, ESP.getPsramSize(), ESP.getFreePsram(),
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  if (!psramFound()) {
+    deviceLog("  PSRAM is not enabled in this build.");
+    deviceLog("  Arduino IDE: Tools > PSRAM > \"OPI PSRAM\"");
+    deviceLog("  arduino-cli: append :PSRAM=opi to the FQBN");
+  }
+  return false;
+}
+
+
+// FreeRTOS task: runs display refresh on core 0 so the main loop stays responsivevoid refreshTask(void* param) {
   deviceLog("refresh task: starting on core %d", xPortGetCoreID());
   // Battery is logged either side of the refresh: a panel that browns out
   // mid-refresh shows up as a sag here, and explains run-to-run variance
@@ -501,6 +533,10 @@ void handleClient(WiFiClient& client) {
                     ",\"uptime\":" + String(millis() / 1000) +
                     ",\"battery\":{\"voltage\":" + String(battV, 2) +
                     ",\"percent\":" + String(battPct) + "}" +
+                    ",\"psram\":{\"found\":" + String(psramFound() ? 1 : 0) +
+                    ",\"size\":" + String(ESP.getPsramSize()) +
+                    ",\"free\":" + String(ESP.getFreePsram()) +
+                    ",\"framebuffer\":" + String(imageBuffer ? 1 : 0) + "}" +
                     "," + batteryDebug() +
                     ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       sendJsonResponse(client, json);
@@ -643,14 +679,10 @@ void handleClient(WiFiClient& client) {
 
   // -------- POST /display — image upload --------
 
-  // Allocate buffer if needed
-  if (!imageBuffer) {
-    imageBuffer = (uint8_t*)ps_malloc(EXPECTED_SIZE);
-    if (!imageBuffer) imageBuffer = (uint8_t*)malloc(EXPECTED_SIZE);
-  }
-  if (!imageBuffer) {
-    deviceLog("ERROR: failed to allocate %u bytes", EXPECTED_SIZE);
-    client.print("HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nOut of memory\r\n");
+  if (!imageBuffer && !allocImageBuffer()) {
+    client.print("HTTP/1.1 500 Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+    client.print("Out of memory: need " + String(EXPECTED_SIZE) + " bytes, PSRAM " +
+                 (psramFound() ? "present but full" : "NOT ENABLED IN BUILD") + "\r\n");
     return;
   }
 
@@ -703,6 +735,15 @@ void setup() {
 
   Serial.println("E-Ink Web Server — T133A01 13.3\" Spectra 6 on EE02");
   Serial.printf("Chip ID: %s  Hostname: %s\n", chipId.c_str(), hostname.c_str());
+  // deviceLog, not Serial: this needs to reach the ring buffer so it shows up
+  // in GET /logs for anyone debugging over the network rather than over USB.
+  deviceLog("PSRAM: found=%d size=%u free=%u | flash=%u heap=%u",
+            psramFound() ? 1 : 0, ESP.getPsramSize(), ESP.getFreePsram(),
+            ESP.getFlashChipSize(), ESP.getFreeHeap());
+
+  // Claim the framebuffer up front: better to fail loudly at boot than to
+  // accept a POST and die 900 KB in.
+  allocImageBuffer();
 
   pinMode(EPD_ENABLE, OUTPUT);
   digitalWrite(EPD_ENABLE, HIGH);
