@@ -69,7 +69,9 @@ impl DisplayBackend for Esp32Backend {
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .body(data)
-            .timeout(Duration::from_secs(30))
+            // A 13.3" panel is 960 KB of 4bpp data vs 192 KB for the 7.3",
+            // and the firmware runs with WiFi light-sleep enabled.
+            .timeout(Duration::from_secs(120))
             .send()
             .await?;
         let status = resp.status();

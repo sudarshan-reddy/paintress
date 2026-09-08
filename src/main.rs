@@ -246,14 +246,16 @@ fn cmd_preview(image_path: &PathBuf, saturation: f32) -> Result<()> {
     let (canvas_w, canvas_h, placements) = if let Some(ref config) = config {
         let mut builder = FreeformBuilder::new();
         for dc in &config.display {
-            let (_cw, _ch) = dc.mounted.canvas_dims(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+            // Use the size recorded at discover time; falls back to the
+            // compiled-in default for configs predating the width/height field.
+            let (native_w, native_h) = dc.dims();
             let dummy = DisplayInfo {
                 id: dc.serial.clone(),
                 ip: String::new(),
                 port: 0,
                 hostname: String::new(),
-                width: DISPLAY_WIDTH,
-                height: DISPLAY_HEIGHT,
+                width: native_w,
+                height: native_h,
             };
             builder = builder.place(&dummy, dc.col, dc.row, dc.mounted.rotation());
         }
