@@ -33,6 +33,19 @@ const char* password = "WIFI-PASSWORD";
 #define WIDTH  1200
 #define HEIGHT 1600
 
+// The 1200x1600 framebuffer is 960 KB. The S3 has ~300 KB of usable DRAM, so
+// without PSRAM this cannot possibly run — fail at build time rather than
+// shipping a binary that dies on the first POST.
+//   Arduino IDE:  Tools > Board > XIAO_ESP32S3_PLUS, then Tools > PSRAM > "OPI PSRAM"
+//   arduino-cli:  --fqbn esp32:esp32:XIAO_ESP32S3_Plus:PSRAM=opi,FlashSize=16M
+#ifndef BOARD_HAS_PSRAM
+#error "PSRAM not enabled. Set Tools > PSRAM > OPI PSRAM (IDE) or add :PSRAM=opi to the FQBN (arduino-cli). See comment above."
+#endif
+
+// Stamped by the compiler. Surfaced at boot and in /info so "is the device
+// running the binary I just built?" is one curl away rather than guesswork.
+#define FIRMWARE_BUILD __DATE__ " " __TIME__
+
 // -------- BATTERY --------
 // EN04 voltage divider: R28=10K, R29=10K → BAT_ADC on GPIO1 (D0/A0)
 // ADC_EN on GPIO6 (D5/A5) — 100K pull-down
@@ -384,9 +397,12 @@ bool allocImageBuffer() {
             psramFound() ? 1 : 0, ESP.getPsramSize(), ESP.getFreePsram(),
             ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   if (!psramFound()) {
-    deviceLog("  PSRAM is not enabled in this build.");
-    deviceLog("  Arduino IDE: Tools > PSRAM > \"OPI PSRAM\"");
-    deviceLog("  arduino-cli: append :PSRAM=opi to the FQBN");
+    // BOARD_HAS_PSRAM is guaranteed by the #error at the top of this file, so
+    // reaching here means the define is set but the chip never came up —
+    // usually the wrong psram_type (this module is OPI, not QSPI) or the
+    // wrong board variant selected.
+    deviceLog("  BOARD_HAS_PSRAM is set but PSRAM did not initialise.");
+    deviceLog("  Check board = XIAO_ESP32S3_PLUS and PSRAM = OPI (not QSPI).");
   }
   return false;
 }
@@ -527,6 +543,7 @@ void handleClient(WiFiClient& client) {
       float battV = readBatteryVoltage();
       int battPct = batteryPercent(battV);
       String json = "{\"id\":\"" + chipId + "\""
+                    ",\"build\":\"" + String(FIRMWARE_BUILD) + "\""
                     ",\"hostname\":\"" + hostname + "\""
                     ",\"width\":" + String(WIDTH) +
                     ",\"height\":" + String(HEIGHT) +
@@ -741,6 +758,7 @@ void setup() {
   deviceLog("PSRAM: found=%d size=%u free=%u | flash=%u heap=%u",
             psramFound() ? 1 : 0, ESP.getPsramSize(), ESP.getFreePsram(),
             ESP.getFlashChipSize(), ESP.getFreeHeap());
+  deviceLog("build: %s", FIRMWARE_BUILD);
 
   // Claim the framebuffer up front: better to fail loudly at boot than to
   // accept a POST and die 900 KB in.
